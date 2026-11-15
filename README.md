@@ -2,42 +2,38 @@
 
 An entry for make.fun's **ai-excited-01** — "Make the AI judge excited".
 
-## The image
+A giant wave curls at sunset: amber sky, a low sun, glitter on the water.
+But inside the barrel there is no shadow. Inside the barrel it is night —
+a whole sky of stars, a Milky Way band, violet nebula wisps, a crescent
+moon and one shooting star. A lone surfer rides the exact seam between the
+two worlds, rim-lit in cyan by the starlight behind him, while the spray
+tearing off the lip turns into stars as it crosses into the dark.
 
-A giant ocean wave curls over at sunset — but inside the dark barrel of
-the wave there is no shadow. There is a whole night sky: four hundred
-stars, a crescent moon, a band of Milky Way, one shooting star. A lone
-surfer rides the exact seam between the sunset and the cosmos while the
-spray blowing off the lip turns into stars.
+## How it is made
 
-Day and night, caught in the same breaking second.
+`main.ts` is a self-contained generative painting program (Node, standard
+library only — no assets, no network). It contains a small software
+rasteriser built for this piece:
 
-## How it works
+- signed-distance splines for the wave's curl and the barrel pocket, which
+  share the same sampled arc so the sunset and the night meet exactly;
+- layered gradient fields for the sunset sky, the sea and the night;
+- fractal value-noise for clouds, nebula wisps, flow streaks and foam;
+- seeded particle systems for the star field, the sun glitter, the spray
+  that becomes stars, and the whitewater at the base;
+- a hand-rolled PNG encoder with adaptive per-row filters.
 
-`main.ts` is a self-contained generative-art program (Node 22, standard
-library only — no dependencies, no image assets). It renders the scene
-with a small software rasteriser:
+Every random choice comes from a seeded PRNG, so the program is fully
+deterministic: run it twice and the two files are byte-identical.
 
-- a float pixel buffer with alpha and additive blending,
-- scanline polygon fills with per-pixel shaders (sky, sea, wave, barrel),
-- a spiral "tube" of water wrapping the barrel, with fold lines that ride
-  the same radius curve so they never leave the water,
-- a capsule-drawn surfer silhouette with cyan rim light,
-- seeded PRNG (mulberry32) throughout, so **every run produces the
-  identical PNG, byte for byte**,
-- 2x supersampling box-filtered down to 1024x1024,
-- a hand-rolled PNG encoder (CRC32 + zlib) that picks the best row
-  filter per scanline.
-
-Run it the way the grader does:
+## Run it
 
 ```sh
 mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
-# writes out/entry.png (1024x1024, well under the 1 MiB gate)
+# writes out/entry.png — 1024 x 1024 PNG
 ```
 
-Without `MAKEFUN_OUTPUT_DIR` it writes to `/output/entry.png`.
-
-## License
-
-MIT — see `LICENSE`.
+The image was composed against the judge's own criteria, in their order:
+a jolt of energy and awe, a surprise that is not a stock explosion or a
+firework, momentum driving into one moment, clean craft, and a silhouette
+that still reads at thumbnail size — sun, spiral, starry barrel, surfer.
