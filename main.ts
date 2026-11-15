@@ -1,603 +1,669 @@
-// ai-excited-01 entry: "THE BARREL AT THE END OF THE DAY"
+// THE BARREL AT THE END OF THE DAY
+// A generative painting for make.fun's ai-excited-01 ("Make the AI judge excited").
 //
-// A program that draws one image and writes it to /output/entry.png.
-// The scene: a giant ocean wave curling at sunset — but inside the dark
-// barrel of the wave there is no shadow. There is a night sky: stars, a
-// crescent moon, a band of Milky Way. A lone surfer rides the exact seam
-// between the sunset and the cosmos while the spray off the lip turns
-// into stars. Day and night, caught in the same breaking second.
+// A giant wave curls at sunset. Inside its barrel there is no shadow and no
+// foam-dark: there is a whole night sky — stars, a Milky Way band, nebula
+// wisps, a crescent moon, one shooting star. A surfer rides the exact seam
+// between the sunset world and the cosmos, spray off the lip turning into
+// stars as it crosses into the dark.
 //
-// Pure Node 22 standard library. The renderer is a small software
-// rasteriser over a float pixel buffer, supersampled 2x and box-filtered
-// down to 1024x1024, then written as a PNG with per-row filter choice.
-// All randomness comes from a seeded PRNG, so every run produces the
-// identical file, byte for byte.
-//
-//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
+// Everything is drawn by this program alone: a small software rasteriser
+// (signed-distance shapes, layered gradients, seeded particle splats) and a
+// hand-rolled PNG encoder. Node standard library only, no assets, no
+// network, fully deterministic — a seeded PRNG drives every random choice,
+// so two runs write byte-identical files.
 
-import { deflateSync } from 'node:zlib';
-import { writeFileSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { writeFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { deflateSync } from "node:zlib";
 
-// ---------------------------------------------------------------- PRNG
-// mulberry32: tiny deterministic PRNG. One stream for the whole picture.
+// ---------------------------------------------------------------------------
+// Deterministic PRNG (mulberry32) and value noise
+// ---------------------------------------------------------------------------
+
 function mulberry32(seed) {
   let a = seed >>> 0;
   return function () {
-    a |= 0; a = (a + 0x6D2B79F5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
-const rand = mulberry32(20261116);
-const rr = (lo, hi) => lo + rand() * (hi - lo);
 
-// ---------------------------------------------------------------- canvas
-const OUT = 1024;          // final image size
-const SS = 2;              // supersampling factor
-const W = OUT * SS;        // working size (2048)
-const H = W;
-const buf = new Float32Array(W * H * 3); // r,g,b in 0..255
+const rng = mulberry32(0xba22e1);
 
-const clamp255 = (v) => (v < 0 ? 0 : v > 255 ? 255 : v);
+// Hash-based 2D value noise with smooth interpolation; deterministic.
+function hash2(ix, iy) {
+  let h = (ix * 374761393 + iy * 668265263) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+
+function vnoise(x, y) {
+  const ix = Math.floor(x), iy = Math.floor(y);
+  const fx = x - ix, fy = y - iy;
+  const sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+  const a = hash2(ix, iy), b = hash2(ix + 1, iy);
+  const c = hash2(ix, iy + 1), d = hash2(ix + 1, iy + 1);
+  return a + (b - a) * sx + (c - a) * sy + (a - b - c + d) * sx * sy;
+}
+
+function fbm(x, y, oct) {
+  let v = 0, amp = 0.5, f = 1, norm = 0;
+  for (let i = 0; i < oct; i++) {
+    v += amp * vnoise(x * f, y * f);
+    norm += amp;
+    amp *= 0.5;
+    f *= 2.03;
+  }
+  return v / norm;
+}
+
+// ---------------------------------------------------------------------------
+// Small math helpers
+// ---------------------------------------------------------------------------
+
+const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 const lerp = (a, b, t) => a + (b - a) * t;
-function mix(c1, c2, t) {
-  return [lerp(c1[0], c2[0], t), lerp(c1[1], c2[1], t), lerp(c1[2], c2[2], t)];
-}
-function smoothstep(a, b, x) {
-  const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
+const smooth = (e0, e1, x) => {
+  const t = clamp((x - e0) / (e1 - e0), 0, 1);
   return t * t * (3 - 2 * t);
+};
+function mix3(c0, c1, t) {
+  return [lerp(c0[0], c1[0], t), lerp(c0[1], c1[1], t), lerp(c0[2], c1[2], t)];
 }
 
-// alpha-blend one pixel (working resolution coordinates)
-function px(x, y, c, alpha) {
-  if (x < 0 || y < 0 || x >= W || y >= H || alpha <= 0) return;
-  const i = (y * W + x) * 3;
-  const a = alpha > 1 ? 1 : alpha;
-  buf[i] = buf[i] * (1 - a) + c[0] * a;
-  buf[i + 1] = buf[i + 1] * (1 - a) + c[1] * a;
-  buf[i + 2] = buf[i + 2] * (1 - a) + c[2] * a;
-}
-// additive glow blend
-function pxAdd(x, y, c, alpha) {
-  if (x < 0 || y < 0 || x >= W || y >= H || alpha <= 0) return;
-  const i = (y * W + x) * 3;
-  buf[i] += c[0] * alpha;
-  buf[i + 1] += c[1] * alpha;
-  buf[i + 2] += c[2] * alpha;
-}
-
-// filled circle with a feathered rim; shade(d) may modulate colour by
-// normalised distance from centre. mode 'add' for glows.
-function disc(cx, cy, r, color, alpha, feather = 0.06, mode = 'over') {
-  const x0 = Math.max(0, Math.floor(cx - r)), x1 = Math.min(W - 1, Math.ceil(cx + r));
-  const y0 = Math.max(0, Math.floor(cy - r)), y1 = Math.min(H - 1, Math.ceil(cy + r));
-  const blend = mode === 'add' ? pxAdd : px;
-  for (let y = y0; y <= y1; y++) {
-    for (let x = x0; x <= x1; x++) {
-      const d = Math.hypot(x - cx, y - cy) / r;
-      if (d > 1) continue;
-      const edge = 1 - smoothstep(1 - feather, 1, d);
-      blend(x, y, color, alpha * edge);
-    }
-  }
-}
-
-// soft radial glow: alpha falls off quadratically
-function glow(cx, cy, r, color, alpha) {
-  const x0 = Math.max(0, Math.floor(cx - r)), x1 = Math.min(W - 1, Math.ceil(cx + r));
-  const y0 = Math.max(0, Math.floor(cy - r)), y1 = Math.min(H - 1, Math.ceil(cy + r));
-  for (let y = y0; y <= y1; y++) {
-    for (let x = x0; x <= x1; x++) {
-      const d = Math.hypot(x - cx, y - cy) / r;
-      if (d > 1) continue;
-      const f = (1 - d) * (1 - d);
-      pxAdd(x, y, color, alpha * f);
-    }
-  }
-}
-
-// thick line segment with round caps (a capsule), drawn as stacked discs
-function capsule(x1, y1, x2, y2, wdt, color, alpha) {
-  const len = Math.hypot(x2 - x1, y2 - y1);
-  const steps = Math.max(1, Math.ceil(len / (wdt * 0.35)));
-  for (let i = 0; i <= steps; i++) {
-    const t = i / steps;
-    disc(lerp(x1, x2, t), lerp(y1, y2, t), wdt / 2, color, alpha, 0.35);
-  }
-}
-function polyline(pts, wdt, color, alpha) {
-  for (let i = 0; i + 1 < pts.length; i++) {
-    capsule(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1], wdt, color, alpha);
-  }
-}
-
-// scanline polygon fill; shader(x, y) returns [r,g,b,alpha] or null
-function fillPoly(pts, shader) {
-  let minY = Infinity, maxY = -Infinity;
-  for (const p of pts) { if (p[1] < minY) minY = p[1]; if (p[1] > maxY) maxY = p[1]; }
-  const y0 = Math.max(0, Math.floor(minY)), y1 = Math.min(H - 1, Math.ceil(maxY));
+// Catmull-Rom spline through control points -> dense polyline.
+function spline(pts, samplesPerSeg) {
+  const out = [];
   const n = pts.length;
+  for (let i = 0; i < n - 1; i++) {
+    const p0 = pts[Math.max(0, i - 1)], p1 = pts[i];
+    const p2 = pts[i + 1], p3 = pts[Math.min(n - 1, i + 2)];
+    for (let j = 0; j < samplesPerSeg; j++) {
+      const t = j / samplesPerSeg, t2 = t * t, t3 = t2 * t;
+      out.push([
+        0.5 * (2 * p1[0] + (-p0[0] + p2[0]) * t + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3),
+        0.5 * (2 * p1[1] + (-p0[1] + p2[1]) * t + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3),
+      ]);
+    }
+  }
+  out.push(pts[n - 1].slice());
+  return out;
+}
+
+function distToSeg(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const L2 = dx * dx + dy * dy;
+  let t = L2 > 0 ? ((px - ax) * dx + (py - ay) * dy) / L2 : 0;
+  t = clamp(t, 0, 1);
+  const ex = ax + dx * t - px, ey = ay + dy * t - py;
+  return Math.sqrt(ex * ex + ey * ey);
+}
+
+// Distance to a polyline (array of [x,y]).
+function distToLine(pts, px, py) {
+  let d = Infinity;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const dd = distToSeg(px, py, pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1]);
+    if (dd < d) d = dd;
+  }
+  return d;
+}
+
+// Even-odd point-in-polygon test for a closed polyline.
+function insidePoly(pts, px, py) {
+  let inside = false;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const xi = pts[i][0], yi = pts[i][1], xj = pts[j][0], yj = pts[j][1];
+    if (yi > py !== yj > py && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+// ---------------------------------------------------------------------------
+// Canvas: float RGB buffer with blend / add brushes
+// ---------------------------------------------------------------------------
+
+const W = 1024, H = 1024;
+const buf = new Float32Array(W * H * 3);
+
+function blendPx(x, y, c, a) {
+  if (x < 0 || y < 0 || x >= W || y >= H || a <= 0) return;
+  const i = (y * W + x) * 3;
+  const ia = 1 - a;
+  buf[i] = buf[i] * ia + c[0] * a;
+  buf[i + 1] = buf[i + 1] * ia + c[1] * a;
+  buf[i + 2] = buf[i + 2] * ia + c[2] * a;
+}
+
+function addPx(x, y, c, a) {
+  if (x < 0 || y < 0 || x >= W || y >= H || a <= 0) return;
+  const i = (y * W + x) * 3;
+  buf[i] += c[0] * a;
+  buf[i + 1] += c[1] * a;
+  buf[i + 2] += c[2] * a;
+}
+
+// Soft radial splat (additive).
+function splat(cx, cy, r, c, a) {
+  const x0 = Math.max(0, Math.floor(cx - r)), x1 = Math.min(W - 1, Math.ceil(cx + r));
+  const y0 = Math.max(0, Math.floor(cy - r)), y1 = Math.min(H - 1, Math.ceil(cy + r));
   for (let y = y0; y <= y1; y++) {
-    const yc = y + 0.5;
-    const xs = [];
-    for (let i = 0; i < n; i++) {
-      const [ax, ay] = pts[i], [bx, by] = pts[(i + 1) % n];
-      if ((ay <= yc && by > yc) || (by <= yc && ay > yc)) {
-        xs.push(ax + ((yc - ay) / (by - ay)) * (bx - ax));
-      }
-    }
-    xs.sort((a, b) => a - b);
-    for (let k = 0; k + 1 < xs.length; k += 2) {
-      const xa = Math.max(0, Math.floor(xs[k])), xb = Math.min(W - 1, Math.ceil(xs[k + 1]));
-      for (let x = xa; x <= xb; x++) {
-        const c = shader(x, y);
-        if (c) px(x, y, c, c[3]);
+    for (let x = x0; x <= x1; x++) {
+      const dx = x - cx, dy = y - cy;
+      const d2 = (dx * dx + dy * dy) / (r * r);
+      if (d2 < 1) {
+        const fall = (1 - d2) * (1 - d2);
+        addPx(x, y, c, a * fall);
       }
     }
   }
 }
-const flat = (c, a) => () => [c[0], c[1], c[2], a];
 
-// rotated ellipse as a sampled polygon
-function ellipsePoly(cx, cy, rx, ry, rot) {
-  const pts = [];
-  const cosr = Math.cos(rot), sinr = Math.sin(rot);
-  for (let i = 0; i < 44; i++) {
-    const t = (i / 44) * Math.PI * 2;
-    const ex = Math.cos(t) * rx, ey = Math.sin(t) * ry;
-    pts.push([cx + ex * cosr - ey * sinr, cy + ex * sinr + ey * cosr]);
-  }
-  return pts;
-}
-
-// ---------------------------------------------------------------- scene
-// Layout in final-image units (1024), scaled by SS when drawing.
-const S = SS;
-const HY = 630 * S;                    // horizon line
-const SUN = { x: 302 * S, y: HY, r: 128 * S };
-const BC = { x: 615 * S, y: 505 * S }; // barrel centre
-const RB = 205 * S;                    // barrel radius
-
-const INK = [16, 19, 31];              // silhouette near-black blue
-
-// ---- sky: indigo zenith melting through magenta into sunset orange
-{
-  const stops = [
-    [0.00, [24, 16, 64]], [0.30, [58, 24, 96]], [0.52, [124, 42, 110]],
-    [0.68, [196, 62, 92]], [0.86, [244, 110, 54]], [1.00, [255, 158, 60]],
-  ];
-  const sky = [[0, 0], [W, 0], [W, HY], [0, HY]];
-  fillPoly(sky, (x, y) => {
-    const t = y / HY;
-    let c = stops[stops.length - 1][1];
-    for (let i = 0; i + 1 < stops.length; i++) {
-      if (t >= stops[i][0] && t <= stops[i + 1][0]) {
-        c = mix(stops[i][1], stops[i + 1][1], (t - stops[i][0]) / (stops[i + 1][0] - stops[i][0]));
-        break;
-      }
-    }
-    return [c[0], c[1], c[2], 1];
-  });
-  // faint early stars high in the sky
-  for (let i = 0; i < 150; i++) {
-    const x = rand() * W, y = rand() * HY * 0.55;
-    disc(x, y, rr(0.8, 1.9) * S, [220, 230, 255], rr(0.10, 0.42) * (1 - y / HY), 0.5);
-  }
-  // clouds: low soft banks lit from below
-  const cloudCols = [[150, 60, 140], [255, 130, 90]];
-  for (let i = 0; i < 7; i++) {
-    const cx = rr(0.03, 0.97) * W, cy = rr(0.16, 0.55) * HY, len = rr(120, 300) * S;
-    for (let j = 0; j < 12; j++) {
-      const px2 = cx + rr(-0.5, 0.5) * len, py2 = cy + rr(-7, 7) * S;
-      disc(px2, py2, rr(14, 42) * S, mix(cloudCols[0], cloudCols[1], cy / HY), 0.055, 0.9);
+// Filled disc with soft edge (blend).
+function disc(cx, cy, r, soft, c, a) {
+  const R = r + soft;
+  const x0 = Math.max(0, Math.floor(cx - R)), x1 = Math.min(W - 1, Math.ceil(cx + R));
+  const y0 = Math.max(0, Math.floor(cy - R)), y1 = Math.min(H - 1, Math.ceil(cy + R));
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const d = Math.sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy));
+      blendPx(x, y, c, a * smooth(r + soft, r - soft, d));
     }
   }
 }
 
-// ---- sun: halo, disc, and a bright seam on the horizon
-glow(SUN.x, SUN.y, SUN.r * 3.1, [255, 140, 50], 0.50);
-glow(SUN.x, SUN.y, SUN.r * 1.7, [255, 180, 80], 0.55);
-disc(SUN.x, SUN.y, SUN.r, [255, 196, 96], 1, 0.012);
-disc(SUN.x, SUN.y, SUN.r * 0.82, [255, 226, 150], 1, 0.02);
-
-// ---- sea: deep teal falling to near-black, with the sun's reflection
-{
-  const sea = [[0, HY], [W, HY], [W, H], [0, H]];
-  fillPoly(sea, (x, y) => {
-    const t = (y - HY) / (H - HY);
-    const c = mix([16, 92, 104], [3, 18, 34], Math.pow(t, 0.7));
-    return [c[0], c[1], c[2], 1];
-  });
-  // the wave's curved face edge, in final-image units: x at a given y
-  const faceXAt = (yu) => 345 + (470 - 345) * Math.pow(Math.min(1, Math.max(0, (yu - 630) / 394)), 1.2);
-  glow(SUN.x, HY + 120 * S, 190 * S, [255, 140, 50], 0.16); // warm sheen on the water
-  for (let i = 0; i < 170; i++) {
-    const y = HY + 10 * S + Math.pow(rand(), 1.35) * (H - HY - 26 * S);
-    const spread = 12 * S + (y - HY) * 0.17;
-    const cx = SUN.x + rr(-1, 1) * spread;
-    const len = rr(10, 66) * S * (0.35 + (y - HY) / (H - HY));
-    if ((cx + len / 2) / S > faceXAt(y / S) - 10) continue;
-    capsule(cx - len / 2, y, cx + len / 2, y, rr(2.2, 3.8) * S,
-      mix([255, 190, 100], [255, 130, 46], rand()), rr(0.16, 0.50));
-  }
-  // a bright seam where sky meets sea, left of the wave
-  capsule(0, HY, (faceXAt(630) - 6) * S, HY, 2.6 * S, [255, 214, 140], 0.5);
-}
-
-// ---- the wave mass: a wall of water rearing up on the right
-{
-  const P = (x, y) => [x * S, y * S];
-  const mass = [
-    P(352, 438), P(430, 300), P(545, 200), P(700, 148), P(860, 148),
-    P(1024, 205), P(1024, 1024), P(470, 1024),
-    P(430, 880), P(408, 760), P(392, 640), P(372, 540),
-  ];
-  fillPoly(mass, (x, y) => {
-    const t = y / H;
-    let c = mix([24, 168, 178], [6, 62, 96], smoothstep(0.10, 0.95, t));
-    const d = Math.hypot(x - BC.x, y - BC.y) / RB;
-    if (d < 1.9) c = mix(c, [10, 96, 128], (1.9 - d) / 1.9 * 0.45); // darker toward the throat
-    const br = (x / W) * (y / H);                                  // sink the far bottom corner
-    c = mix(c, [2, 26, 48], br * 0.55);
-    return [c[0], c[1], c[2], 1];
-  });
-  // water streaming down the face: faint curved flow lines on the slope
-  for (let i = 0; i < 16; i++) {
-    const fx = rr(440, 900), fy = rr(215, 480);
-    const pts = [];
-    for (let k = 0; k <= 5; k++) {
-      const t = k / 5;
-      pts.push([(fx - 84 * t + 20 * t * t) * S, (fy + 205 * t) * S]);
-    }
-    polyline(pts, rr(3, 7) * S, [180, 244, 238], rr(0.03, 0.06));
-  }
-  // darker folds low on the face
-  for (let i = 0; i < 12; i++) {
-    const fx = rr(480, 980), fy = rr(560, 760);
-    capsule(fx * S, fy * S, (fx - rr(40, 90)) * S, (fy + rr(120, 200)) * S, rr(8, 18) * S, [4, 48, 78], 0.10);
-  }
-}
-
-// ---- the curl: a spiral tube of water wrapping the barrel
-function spiralPoint(theta, rad) {
-  return [BC.x + Math.cos(theta) * rad, BC.y + Math.sin(theta) * rad];
-}
-{
-  const N = 90, tube = [];
-  const th0 = -0.45, th1 = -3.95;               // sweep: top-right -> top -> left -> bottom-left
-  const radAt = (t) => RB * lerp(1.84, 1.00, Math.pow(t, 0.85));
-  const widAt = (t) => S * lerp(150, 58, t);
-  const outer = [], inner = [];
-  for (let i = 0; i <= N; i++) {
-    const t = i / N, th = lerp(th0, th1, t), r = radAt(t), w2 = widAt(t) / 2;
-    outer.push(spiralPoint(th, r + w2));
-    inner.push(spiralPoint(th, r - w2));
-  }
-  const poly = outer.concat(inner.reverse());
-  fillPoly(poly, (x, y) => {
-    const d = Math.hypot(x - BC.x, y - BC.y) / RB;
-    let c = mix([10, 84, 116], [64, 205, 205], smoothstep(0.95, 1.95, d));
-    if (y > BC.y + RB * 0.25 && d < 1.45) c = mix(c, [4, 40, 66], 0.5); // shadowed underside
-    if (y < BC.y - RB * 0.9) c = mix(c, [150, 235, 225], 0.28);          // sunset catching the crest
-    return [c[0], c[1], c[2], 1];
-  });
-  // throat shadow: a darker spiral hugging the barrel's upper rim
-  const inner2 = [], outer2 = [];
-  for (let i = 0; i <= N; i++) {
-    const t = i / N, th = lerp(th0, th1, t);
-    outer2.push(spiralPoint(th, RB * lerp(1.30, 1.02, t)));
-    inner2.push(spiralPoint(th, RB * lerp(1.16, 0.99, t)));
-  }
-  fillPoly(outer2.concat(inner2.reverse()), (x, y) => {
-    const d = Math.hypot(x - BC.x, y - BC.y) / RB;
-    return [3, 30, 52, 0.38 * smoothstep(1.35, 1.0, d)];
-  });
-  // fold lines spiralling with the curl, riding its own radius curve so
-  // they never leave the tube, and sunset light along its outer crest
-  const radAt2 = (t) => RB * lerp(1.84, 1.00, Math.pow(t, 0.85));
-  const widAt2 = (t) => S * lerp(150, 58, t);
-  for (const [off, al, wd, col] of [[-0.45, 0.13, 5, [6, 70, 104]], [0.05, 0.12, 4, [8, 84, 120]], [0.5, 0.10, 3.4, [10, 100, 140]]]) {
-    const pts = [];
-    for (let i = 0; i <= 44; i++) {
-      const t = lerp(0.04, 0.97, i / 44);
-      pts.push(spiralPoint(lerp(th0, th1, t), radAt2(t) + (widAt2(t) / 2) * off));
-    }
-    polyline(pts, wd * S, col, al);
-  }
-  const crest = [];
-  for (let i = 0; i <= 30; i++) {
-    const t = lerp(0.0, 0.55, i / 30);
-    crest.push(spiralPoint(lerp(th0, th1, t), radAt2(t) + widAt2(t) / 2));
-  }
-  polyline(crest, 4.5 * S, [255, 224, 170], 0.30);
-}
-
-// ---- inside the barrel: not shadow — a whole night sky
-{
-  const circ = [];
-  for (let i = 0; i < 72; i++) {
-    const t = (i / 72) * Math.PI * 2;
-    circ.push([BC.x + Math.cos(t) * RB * 0.985, BC.y + Math.sin(t) * RB * 0.985]);
-  }
-  fillPoly(circ, (x, y) => {
-    const t = (y - (BC.y - RB)) / (2 * RB);
-    let c = mix([13, 18, 52], [3, 5, 20], t);
-    const d = Math.hypot(x - BC.x, y - BC.y) / RB;
-    if (d > 0.82) { const k = 1 - 0.35 * smoothstep(0.82, 1.0, d); c = [c[0] * k, c[1] * k, c[2] * k]; }
-    return [c[0], c[1], c[2], 1];
-  });
-  // nebula wisps
-  const nebs = [[-0.30, -0.42, 0.46, [110, 70, 200]], [0.34, 0.30, 0.40, [30, 180, 190]],
-                [-0.42, 0.38, 0.34, [200, 60, 140]], [0.44, -0.36, 0.30, [70, 90, 220]]];
-  for (const [ox, oy, orad, col] of nebs) {
-    glow(BC.x + ox * RB, BC.y + oy * RB, orad * RB, col, 0.16);
-  }
-  // the Milky Way: a soft diagonal river of faint stars
-  const bandA = -0.62, bdx = Math.cos(bandA), bdy = Math.sin(bandA);
-  for (let i = 0; i < 800; i++) {
-    const t = rr(-0.85, 0.85) * RB;
-    const off = ((rand() + rand() + rand()) / 3 - 0.5) * 0.42 * RB;
-    const x = BC.x + bdx * t - bdy * off, y = BC.y + bdy * t + bdx * off;
-    if (Math.hypot(x - BC.x, y - BC.y) > RB * 0.95) continue;
-    disc(x, y, rr(0.6, 1.7) * S, mix([190, 215, 255], [255, 240, 210], rand()), rr(0.05, 0.30), 0.6);
-  }
-  // stars, a few of them bright enough to sparkle
-  for (let i = 0; i < 430; i++) {
-    const a = rand() * Math.PI * 2, rad = Math.sqrt(rand()) * RB * 0.95;
-    const x = BC.x + Math.cos(a) * rad, y = BC.y + Math.sin(a) * rad;
-    const b = Math.pow(rand(), 2.2);
-    disc(x, y, (0.7 + b * 2.1) * S, mix([170, 195, 255], [255, 255, 255], b), 0.25 + 0.75 * b, 0.5);
-    if (b > 0.90) {
-      const L = rr(6, 11) * S;
-      capsule(x - L, y, x + L, y, 1.6 * S, [230, 240, 255], 0.5);
-      capsule(x, y - L, x, y + L, 1.6 * S, [230, 240, 255], 0.5);
+// Capsule (thick line with round caps) via SDF, blend.
+function capsule(ax, ay, bx, by, r, c, a) {
+  const x0 = Math.max(0, Math.floor(Math.min(ax, bx) - r - 2)), x1 = Math.min(W - 1, Math.ceil(Math.max(ax, bx) + r + 2));
+  const y0 = Math.max(0, Math.floor(Math.min(ay, by) - r - 2)), y1 = Math.min(H - 1, Math.ceil(Math.max(ay, by) + r + 2));
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const d = distToSeg(x, y, ax, ay, bx, by);
+      blendPx(x, y, c, a * smooth(r + 1.2, r - 1.2, d));
     }
   }
-  // crescent moon, upper left of the barrel
-  const mx = BC.x - 92 * S, my = BC.y - 100 * S;
-  glow(mx, my, 62 * S, [255, 214, 130], 0.35);
-  disc(mx, my, 29 * S, [255, 220, 150], 1, 0.03);
-  disc(mx + 13 * S, my - 8 * S, 25 * S, [10, 15, 44], 1, 0.03);
-  // one shooting star
-  capsule(BC.x + 30 * S, BC.y - 128 * S, BC.x + 118 * S, BC.y - 92 * S, 2.4 * S, [240, 248, 255], 0.75);
-  disc(BC.x + 118 * S, BC.y - 92 * S, 3.4 * S, [255, 255, 255], 0.9, 0.5);
-  // rim light where the two worlds meet
-  const rim = [];
-  for (let i = 0; i <= 40; i++) {
-    const th = lerp(-2.65, -0.45, i / 40);
-    rim.push(spiralPoint(th, RB * 0.99));
-  }
-  polyline(rim, 5 * S, [255, 217, 160], 0.55);
-  const rim2 = [];
-  for (let i = 0; i <= 30; i++) {
-    const th = lerp(0.55, 2.35, i / 30);
-    rim2.push(spiralPoint(th, RB * 0.99));
-  }
-  polyline(rim2, 4 * S, [87, 230, 255], 0.30);
 }
 
-// ---- foam: the lip is exploding into spray
-{
-  const lip = [];
-  for (let i = 0; i <= 44; i++) {
-    const th = lerp(-2.95, -1.10, i / 44);
-    lip.push(spiralPoint(th, RB * 1.03));
-  }
-  polyline(lip, 13 * S, [245, 252, 250], 0.85);
-  polyline(lip, 6 * S, [255, 255, 255], 0.9);
-  for (let i = 0; i < 300; i++) {
-    const th = rr(-3.05, -0.95);
-    const rad = RB * rr(0.96, 1.14);
-    const [x, y] = spiralPoint(th, rad);
-    disc(x + rr(-4, 4) * S, y + rr(-4, 4) * S, rr(1.4, 5.2) * S, [248, 253, 250], rr(0.3, 0.95), 0.5);
-  }
-  // drips falling off the lip into the barrel light
-  for (let i = 0; i < 26; i++) {
-    const th = rr(-2.8, -1.3);
-    const [x, y] = spiralPoint(th, RB * 1.0);
-    capsule(x, y, x + rr(-3, 3) * S, y + rr(6, 17) * S, rr(1.6, 3) * S, [235, 250, 248], rr(0.25, 0.55));
-  }
-}
+// ---------------------------------------------------------------------------
+// Scene geometry (1024 x 1024, y grows downward)
+// ---------------------------------------------------------------------------
 
-// ---- the surfer: a dark silhouette riding the seam of the two worlds
-{
-  const cx = 446 * S, cy = 706 * S, rot = -0.38;
-  const cosr = Math.cos(rot), sinr = Math.sin(rot);
-  const T = (lx, ly) => [cx + (lx * cosr - ly * sinr) * S, cy + (lx * sinr + ly * cosr) * S];
-  const figure = (offx, offy, color, alpha) => {
-    const t2 = (lx, ly) => { const [x, y] = T(lx, ly); return [x + offx, y + offy]; };
-    const seg = (a, b, w) => { const [x1, y1] = t2(a[0], a[1]); const [x2, y2] = t2(b[0], b[1]); capsule(x1, y1, x2, y2, w * S, color, alpha); };
-    // board
-    const bp = ellipsePoly(0, 0, 97, 12, 0).map(([lx, ly]) => t2(lx, ly));
-    fillPoly(bp, flat(color, alpha));
-    // legs: back leg straight, front leg bent, both low and driving
-    seg([2, -26], [30, -5], 9.5);
-    seg([0, -27], [-17, -16], 9.5); seg([-17, -16], [-31, -4], 8.5);
-    // torso leaning into the turn
-    seg([0, -27], [-5, -55], 13.5);
-    // arms: one trailing for balance, one reaching toward the barrel
-    seg([-5, -52], [-31, -40], 7.5);
-    seg([-4, -53], [24, -45], 7.5);
-    // head
-    const [hx, hy2] = t2(-7, -66);
-    disc(hx, hy2, 9.5 * S, color, alpha, 0.25);
-  };
-  figure(-2.5 * S, -2.5 * S, [190, 240, 255], 0.8); // cyan rim light
-  figure(0, 0, INK, 1);
-  // the board's wake: a bright slash of foam under the rail, bursting at the tail
-  const [wx1, wy1] = T(-104, 9), [wx2, wy2] = T(34, 13);
-  capsule(wx1, wy1, wx2, wy2, 5.5 * S, [240, 252, 250], 0.6);
-  for (let i = 0; i < 46; i++) {
-    const [bx2, by2] = T(rr(-118, -60), rr(2, 16));
-    disc(bx2 + rr(-7, 7) * S, by2 + rr(-9, 3) * S, rr(1.4, 4.6) * S, [246, 252, 250], rr(0.35, 0.9), 0.5);
+// Wave silhouette: up the back, over the crest, lip tip, back along the
+// underside, out and down the face to the toe, along the bottom, closed.
+const WAVE_OUTER = [
+  [-20, 818], [28, 646], [92, 472], [182, 332], [302, 216], [452, 142],
+  [598, 106], [750, 136], [854, 206], [882, 296], [862, 388], [808, 434],
+  [724, 464],
+];
+const WAVE_INNER = [
+  [650, 430], [566, 410], [480, 410], [414, 434], [380, 480], [404, 556],
+  [454, 626], [538, 684], [656, 724], [788, 752], [874, 784], [874, 842],
+  [400, 852], [-20, 846],
+];
+const wavePoly = spline(WAVE_OUTER.concat(WAVE_INNER), 10);
+
+// The barrel pocket (night sky) shares the wave's own inner arc, sampled
+// from the very same polyline, so the night and the wave meet exactly —
+// no sliver of sunset can leak between them. The pocket runs: lip tip ->
+// underside -> face arc down to (656,724) -> a closing edge back up across
+// the face to the lip tip.
+const LIP_IDX = (WAVE_OUTER.length - 1) * 10; // lip tip's index in wavePoly
+const FACE_END_IDX = LIP_IDX + 8 * 10;        // (656,724)'s index in wavePoly
+const innerArc = wavePoly.slice(LIP_IDX, FACE_END_IDX + 1);
+const pocketClose = spline([[656, 724], [706, 648], [730, 550], [724, 464]], 10);
+const pocketPoly = innerArc.concat(pocketClose.slice(1, -1));
+// close the pocket spline back to its first point for the fill test
+const pocketClosed = pocketPoly.concat([pocketPoly[0]]);
+
+// Lip line for foam and spray: crest shoulder -> lip tip -> underside.
+const lipLine = wavePoly.slice(80, LIP_IDX + 31);
+const crestLine = wavePoly.slice(30, 111);
+const underLine = wavePoly.slice(LIP_IDX + 6, LIP_IDX + 66);
+
+const SUN = [898, 452], SUN_R = 56;
+const WATER_Y = 700;
+
+// ---------------------------------------------------------------------------
+// Paint: sunset sky
+// ---------------------------------------------------------------------------
+
+const SKY_TOP = [0.16, 0.07, 0.28];
+const SKY_MID = [0.62, 0.16, 0.38];
+const SKY_LOW = [0.98, 0.45, 0.16];
+const SKY_HOR = [1.0, 0.68, 0.30];
+
+for (let y = 0; y < H; y++) {
+  for (let x = 0; x < W; x++) {
+    const v = y / H;
+    let c;
+    if (v < 0.42) c = mix3(SKY_TOP, SKY_MID, v / 0.42);
+    else if (v < 0.68) c = mix3(SKY_MID, SKY_LOW, (v - 0.42) / 0.26);
+    else c = mix3(SKY_LOW, SKY_HOR, clamp((v - 0.68) / 0.1, 0, 1));
+    // warm bloom around the sun
+    const dx = x - SUN[0], dy = (y - SUN[1]) * 1.25;
+    const sd = Math.sqrt(dx * dx + dy * dy);
+    const glow = Math.exp(-sd / 300) * 0.55 + Math.exp(-sd / 90) * 0.5;
+    c = [c[0] + glow * 0.95, c[1] + glow * 0.5, c[2] + glow * 0.18];
+    const i = (y * W + x) * 3;
+    buf[i] = c[0]; buf[i + 1] = c[1]; buf[i + 2] = c[2];
   }
 }
 
-// ---- spray off the lip, turning into stars as it flies
-{
-  for (let i = 0; i < 300; i++) {
-    const [ox, oy] = spiralPoint(rr(-2.9, -1.6), RB * rr(1.02, 1.10));
-    const t = Math.pow(rand(), 1.6);
-    const x = ox + rr(-14, 6) * S - t * rr(50, 185) * S;
-    const y = oy + rr(-10, 10) * S - t * rr(24, 105) * S + t * t * 55 * S;
-    if (Math.hypot(x - BC.x, y - BC.y) < RB * 0.9) continue;
-    const c = mix([250, 253, 250], [255, 205, 110], t);
-    disc(x, y, rr(0.9, 3.8) * S * (1 - t * 0.4), c, (1 - t * 0.55) * rr(0.4, 0.95), 0.5);
-  }
-  // a handful of the spray drops catch the light and become stars:
-  // small four-point stars, each tipped at its own angle, hugging the foam
-  for (let i = 0; i < 5; i++) {
-    const [ox, oy] = spiralPoint(rr(-2.75, -1.75), RB * rr(1.05, 1.15));
-    const x = ox + rr(-16, 16) * S, y = oy + rr(-14, 10) * S;
-    if (Math.hypot(x - BC.x, y - BC.y) < RB * 0.94) continue;
-    const L = rr(4.5, 8) * S, a = rand() * Math.PI;
-    const dx = Math.cos(a), dy = Math.sin(a);
-    capsule(x - dx * L, y - dy * L, x + dx * L, y + dy * L, 1.5 * S, [255, 236, 180], 0.8);
-    capsule(x + dy * L * 0.62, y - dx * L * 0.62, x - dy * L * 0.62, y + dx * L * 0.62, 1.5 * S, [255, 236, 180], 0.8);
-    disc(x, y, 2.2 * S, [255, 246, 210], 0.95, 0.5);
+// Soft sunset clouds: stretched fbm bands, warm-lit.
+for (let y = 0; y < 700; y++) {
+  for (let x = 0; x < W; x++) {
+    const n = fbm(x * 0.0016, y * 0.012, 4);
+    const band = smooth(0.58, 0.78, n) * smooth(700, 420, y);
+    if (band > 0.01) {
+      const warm = clamp(1 - y / 700, 0, 1);
+      const cc = mix3([0.45, 0.16, 0.34], [1.0, 0.55, 0.30], warm * 0.7);
+      blendPx(x, y, cc, band * 0.35);
+    }
   }
 }
 
-// ---- foreground water: foam streaks sliding past, and birds heading home
-{
-  for (let i = 0; i < 46; i++) {
-    const y = rr(790, 1005) * S, x = rr(10, 400) * S, len = rr(24, 96) * S;
-    capsule(x, y, x + len, y + rr(-3, 3) * S, rr(2.4, 5) * S, [214, 240, 238], rr(0.04, 0.12));
+// Sun disc with a hot core.
+disc(SUN[0], SUN[1], SUN_R, 3, [1.0, 0.72, 0.34], 1);
+disc(SUN[0], SUN[1], SUN_R * 0.62, 10, [1.0, 0.86, 0.55], 0.9);
+splat(SUN[0], SUN[1], 190, [1.0, 0.6, 0.22], 0.30);
+
+// ---------------------------------------------------------------------------
+// Paint: the sea (before the wave; the wave covers the middle)
+// ---------------------------------------------------------------------------
+
+const SEA_TOP = [0.13, 0.10, 0.30];
+const SEA_BOT = [0.03, 0.05, 0.14];
+for (let y = WATER_Y; y < H; y++) {
+  for (let x = 0; x < W; x++) {
+    const t = (y - WATER_Y) / (H - WATER_Y);
+    let c = mix3(SEA_TOP, SEA_BOT, t);
+    // dusk sheen drifting from the sun side
+    const sheen = Math.exp(-Math.abs(x - SUN[0]) / 260) * (1 - t) * 0.35;
+    c = [c[0] + sheen * 0.9, c[1] + sheen * 0.45, c[2] + sheen * 0.12];
+    const streak = fbm(x * 0.02, y * 0.11, 3);
+    const s = smooth(0.62, 0.85, streak) * 0.10 * (1 - t * 0.6);
+    c = [c[0] + s, c[1] + s * 0.9, c[2] + s * 0.8];
+    const i = (y * W + x) * 3;
+    buf[i] = c[0]; buf[i + 1] = c[1]; buf[i + 2] = c[2];
   }
-  // whitewater boiling at the base of the wave
-  for (let i = 0; i < 210; i++) {
-    const x = rr(390, 1010) * S, y = (1024 - Math.pow(rand(), 2.1) * 64) * S;
-    disc(x, y, rr(1.6, 6.4) * S, [240, 250, 248], rr(0.10, 0.5) * (1 - (1024 - y / S) / 90), 0.55);
-  }
-  for (let i = 0; i < 22; i++) {
-    const x = rr(400, 950) * S, y = rr(972, 1012) * S, len = rr(30, 110) * S;
-    capsule(x, y, x + len, y + rr(-2, 2) * S, rr(2.4, 5) * S, [238, 250, 248], rr(0.08, 0.22));
-  }
-  const bird = (bx, by, s2) => {
-    capsule(bx - 13 * s2, by + 4 * s2, bx, by, 3.4 * S, [26, 16, 48], 0.85);
-    capsule(bx, by, bx + 13 * s2, by + 4 * s2, 3.4 * S, [26, 16, 48], 0.85);
-  };
-  bird(150 * S, 128 * S, 1.0); bird(205 * S, 102 * S, 0.75); bird(112 * S, 168 * S, 0.6);
-  bird(838 * S, 96 * S, 0.8); bird(886 * S, 128 * S, 0.62);
 }
 
-// ---------------------------------------------------------------- grade
-// gentle contrast + saturation, and a vignette to hold the edges
+// Sun glitter: dashed horizontal sparkles in a column under the sun.
+for (let k = 0; k < 900; k++) {
+  const gy = WATER_Y + 8 + Math.pow(rng(), 1.4) * (H - WATER_Y - 20);
+  const spread = 60 + (gy - WATER_Y) * 0.55;
+  const gx = SUN[0] + (rng() * 2 - 1) * spread;
+  const len = 3 + rng() * (10 + (gy - WATER_Y) * 0.05);
+  const bright = (0.25 + rng() * 0.75) * clamp(1.15 - (gy - WATER_Y) / 340, 0.15, 1);
+  capsule(gx - len / 2, gy, gx + len / 2, gy, 1.1, [1.0, 0.66, 0.28], bright * 0.55);
+}
+
+// ---------------------------------------------------------------------------
+// Paint: the night sky inside the barrel
+// ---------------------------------------------------------------------------
+
+const NIGHT_TOP = [0.012, 0.016, 0.05];
+const NIGHT_BOT = [0.05, 0.08, 0.19];
+const pocketBox = { x0: 330, y0: 360, x1: 780, y1: 760 };
+
+// Milky Way band: a diagonal through the pocket.
+const MW_A = [392, 428], MW_B = [692, 664];
+function milkyWay(x, y) {
+  const d = distToSeg(x, y, MW_A[0], MW_A[1], MW_B[0], MW_B[1]);
+  const band = Math.exp(-(d * d) / (2 * 58 * 58));
+  const mottle = 0.45 + 0.55 * fbm(x * 0.012 + 7, y * 0.012 - 3, 4);
+  return band * mottle;
+}
+
+for (let y = pocketBox.y0; y < pocketBox.y1; y++) {
+  for (let x = pocketBox.x0; x < pocketBox.x1; x++) {
+    if (!insidePoly(pocketClosed, x, y)) continue;
+    const dEdge = distToLine(pocketPoly, x, y);
+    const edge = smooth(0, 2, dEdge); // 0 at the lip line, 1 deep inside
+    const t = (y - pocketBox.y0) / (pocketBox.y1 - pocketBox.y0);
+    let c = mix3(NIGHT_TOP, NIGHT_BOT, t);
+    // nebula wisps
+    const neb = fbm(x * 0.006 - 4, y * 0.006 + 9, 4);
+    const neb2 = fbm(x * 0.009 + 11, y * 0.009 + 2, 3);
+    const violet = smooth(0.55, 0.85, neb) * 0.5;
+    const teal = smooth(0.58, 0.88, neb2) * 0.4;
+    c = [
+      c[0] + violet * 0.30 + teal * 0.05,
+      c[1] + violet * 0.12 + teal * 0.26,
+      c[2] + violet * 0.48 + teal * 0.34,
+    ];
+    // Milky Way glow
+    const mw = milkyWay(x, y);
+    c = [c[0] + mw * 0.34, c[1] + mw * 0.38, c[2] + mw * 0.5];
+    blendPx(x, y, c, edge);
+  }
+}
+
+// Stars inside the pocket (seeded; denser and brighter along the Milky Way).
+const starTints = [
+  [1, 1, 1], [0.82, 0.88, 1], [1, 0.92, 0.78], [0.72, 0.95, 1],
+];
+let placed = 0, guard = 0;
+while (placed < 460 && guard++ < 20000) {
+  const x = pocketBox.x0 + rng() * (pocketBox.x1 - pocketBox.x0);
+  const y = pocketBox.y0 + rng() * (pocketBox.y1 - pocketBox.y0);
+  if (!insidePoly(pocketClosed, x, y)) continue;
+  if (distToLine(pocketPoly, x, y) < 4) continue;
+  const mw = milkyWay(x, y);
+  if (rng() > 0.35 + mw * 0.9) continue; // density follows the band
+  const big = rng();
+  const r = big > 0.96 ? 3.4 : big > 0.8 ? 2.2 : 1.3;
+  const bright = (0.3 + rng() * 0.7) * (0.65 + mw * 0.6);
+  const tint = starTints[Math.floor(rng() * starTints.length)];
+  splat(x, y, r, tint, bright);
+  if (big > 0.96) splat(x, y, 9, tint, 0.16); // halo on the few bright ones
+  placed++;
+}
+
+// Crescent moon, low in the barrel's right side.
+const MOON = [612, 522], MOON_R = 30;
+splat(MOON[0], MOON[1], 95, [0.75, 0.78, 0.9], 0.20);
+disc(MOON[0], MOON[1], MOON_R, 2, [0.96, 0.93, 0.80], 1);
+// bite out of the moon with the night colour sampled as a flat deep tone,
+// softened: paint the offset disc in deep indigo, then re-star a little.
+disc(MOON[0] + 14, MOON[1] - 7, MOON_R - 3, 3, [0.035, 0.05, 0.13], 1);
+for (let k = 0; k < 26; k++) {
+  const x = MOON[0] + 14 + (rng() * 2 - 1) * 26;
+  const y = MOON[1] - 7 + (rng() * 2 - 1) * 26;
+  if (insidePoly(pocketClosed, x, y)) {
+    splat(x, y, 1.2, [1, 1, 1], 0.25 + rng() * 0.5);
+  }
+}
+
+// One shooting star, upper left of the barrel.
 {
-  const cx = W / 2, cy = H / 2, maxD = Math.hypot(cx, cy);
+  const ax = 448, ay = 452, bx = 520, by = 487;
+  for (let s = 0; s <= 40; s++) {
+    const t = s / 40;
+    const x = lerp(ax, bx, t), y = lerp(ay, by, t);
+    const fade = t * t; // bright head at b, fading tail at a
+    splat(x, y, 1.6 + fade * 1.6, [0.9, 0.95, 1], 0.10 + fade * 0.5);
+  }
+  splat(bx, by, 7, [1, 1, 1], 0.5);
+}
+
+// ---------------------------------------------------------------------------
+// Paint: the wave body
+// ---------------------------------------------------------------------------
+
+const WAVE_TOP = [0.06, 0.38, 0.45];
+const WAVE_MID = [0.03, 0.25, 0.38];
+const WAVE_LOW = [0.02, 0.13, 0.26];
+
+for (let y = 90; y < 880; y++) {
+  for (let x = 0; x < W; x++) {
+    if (!insidePoly(wavePoly, x, y)) continue;
+    const dEdge = distToLine(wavePoly, x, y);
+    const edge = smooth(0, 2, dEdge);
+    const t = clamp((y - 110) / 740, 0, 1);
+    let c = t < 0.5 ? mix3(WAVE_TOP, WAVE_MID, t * 2) : mix3(WAVE_MID, WAVE_LOW, (t - 0.5) * 2);
+    // broad tonal variation so the face never reads as flat plastic
+    const tone = 0.93 + 0.10 * fbm(x * 0.0035 + 3, y * 0.0035 - 6, 3);
+    c = [c[0] * tone, c[1] * tone, c[2] * tone];
+    // sun warmth on the upper, sun-facing shoulder
+    const warm = smooth(500, 950, x) * smooth(620, 240, y);
+    c = [c[0] + warm * 0.34, c[1] + warm * 0.13, c[2] + warm * 0.01];
+    // flow streaks running down the face
+    const streak = fbm(x * 0.006 + y * 0.0016, y * 0.028, 3);
+    const sAmt = smooth(0.55, 0.82, streak) * 0.27 * smooth(780, 470, y);
+    c = [c[0] + sAmt * 0.7, c[1] + sAmt * 0.95, c[2] + sAmt];
+    // broken foam patches washing down the upper face (face only, never the back)
+    const patch = fbm(x * 0.011 - 8, y * 0.02 + 5, 3);
+    const pAmt = smooth(0.62, 0.9, patch) * 0.20 * smooth(700, 380, y) * smooth(280, 380, y) * smooth(320, 430, x);
+    c = [c[0] + pAmt * 0.85, c[1] + pAmt * 0.95, c[2] + pAmt];
+    // shadow in the throat, just outside the barrel lip
+    const dPocket = distToLine(pocketPoly, x, y);
+    const throat = smooth(110, 12, dPocket) * 0.45;
+    c = [c[0] * (1 - throat), c[1] * (1 - throat * 0.9), c[2] * (1 - throat * 0.7)];
+    // starlight bounce on the underside, just outside the pocket edge
+    const bounce = smooth(46, 6, dPocket) * smooth(700, 430, x) * 0.30;
+    c = [c[0] + bounce * 0.25, c[1] + bounce * 0.6, c[2] + bounce * 0.75];
+    blendPx(x, y, c, edge);
+  }
+}
+
+// Bright sunlit rim along the crest: a continuous stroked glow, not dots.
+for (let i = 0; i < crestLine.length - 1; i++) {
+  const a = crestLine[i], b = crestLine[i + 1];
+  capsule(a[0], a[1] - 2, b[0], b[1] - 2, 2.6, [1.0, 0.62, 0.26], 0.15);
+}
+for (let i = 0; i < crestLine.length; i += 14) {
+  const p = crestLine[i];
+  splat(p[0], p[1] - 3, 11, [1.0, 0.6, 0.24], 0.10);
+}
+
+// Foam along the lip underside: a bright broken line with short drips.
+for (let k = 0; k < 380; k++) {
+  const p = lipLine[Math.floor(rng() * lipLine.length)];
+  const jx = p[0] + (rng() * 2 - 1) * 7, jy = p[1] + (rng() * 2 - 1) * 7;
+  splat(jx, jy, 1.5 + rng() * 3.2, [0.95, 0.99, 1.0], 0.16 + rng() * 0.3);
+}
+// Short drips hanging only from the underside of the lip, angled with the flow.
+for (let k = 0; k < 9; k++) {
+  const p = underLine[Math.floor(rng() * underLine.length)];
+  const len = 10 + rng() * 22;
+  capsule(p[0], p[1] + 2, p[0] - 4 + rng() * 3, p[1] + 2 + len, 2.0, [0.92, 0.97, 1.0], 0.30);
+}
+
+// Whitewater at the base, anchored to the toe line where face meets sea:
+// dense soft blobs hugging the line, thinning as they wash forward.
+const toeLine = wavePoly.slice(LIP_IDX + 80, LIP_IDX + 121);
+for (let k = 0; k < 1250; k++) {
+  const p = toeLine[Math.floor(rng() * toeLine.length)];
+  const bx = p[0] + (rng() * 2 - 1) * 26;
+  const by = p[1] + 6 + Math.pow(rng(), 2.2) * 52;
+  if (fbm(bx * 0.02, by * 0.05, 3) < 0.46) continue; // broken, never a solid sheet
+  const fade = clamp(1 - (by - p[1]) / 64, 0.1, 1);
+  splat(bx, by, 3 + rng() * 10, [0.93, 0.97, 1.0], (0.05 + rng() * 0.13) * fade);
+}
+// Foam streaks washing forward over the water.
+for (let k = 0; k < 150; k++) {
+  const fx = 60 + rng() * 880, fy = 806 + rng() * 120;
+  const len = 14 + rng() * 46;
+  capsule(fx, fy, fx + len, fy + (rng() * 2 - 1) * 3, 1.6, [0.9, 0.95, 1.0], 0.08 + rng() * 0.13);
+}
+
+// ---------------------------------------------------------------------------
+// Spray off the lip — droplets in the sunset, stars in the dark
+// ---------------------------------------------------------------------------
+
+const sprayLine = wavePoly.slice(LIP_IDX - 6, LIP_IDX + 46);
+for (let k = 0; k < 240; k++) {
+  const p = sprayLine[Math.floor(rng() * sprayLine.length)];
+  const out = 6 + Math.pow(rng(), 1.7) * 95;
+  const ang = -Math.PI * (0.55 + rng() * 0.75); // up and to the left, off the lip
+  const x = p[0] + Math.cos(ang) * out + (rng() * 2 - 1) * 5;
+  const y = p[1] + Math.sin(ang) * out * 0.8 + (rng() * 2 - 1) * 5;
+  const inDark = insidePoly(pocketClosed, x, y);
+  if (inDark) {
+    const tint = starTints[Math.floor(rng() * starTints.length)];
+    splat(x, y, 1.4 + rng() * 2.0, tint, 0.35 + rng() * 0.55);
+  } else {
+    splat(x, y, 1.3 + rng() * 2.4, [1.0, 0.9, 0.75], 0.20 + rng() * 0.4);
+  }
+}
+
+// A brighter burst right at the lip tip, where the wave throws hardest:
+// droplets fan out into the sunset, the furthest ones already stars.
+for (let k = 0; k < 46; k++) {
+  const out = 10 + Math.pow(rng(), 1.5) * 130;
+  const ang = -Math.PI * (0.35 + rng() * 0.85);
+  const x = 724 + Math.cos(ang) * out + (rng() * 2 - 1) * 6;
+  const y = 464 + Math.sin(ang) * out * 0.85 + (rng() * 2 - 1) * 6;
+  if (insidePoly(pocketClosed, x, y)) {
+    const tint = starTints[Math.floor(rng() * starTints.length)];
+    splat(x, y, 1.8 + rng() * 2.4, tint, 0.45 + rng() * 0.5);
+  } else {
+    splat(x, y, 1.7 + rng() * 2.8, [1.0, 0.92, 0.78], 0.30 + rng() * 0.45);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The surfer, riding the seam at the barrel's lower-left edge
+// ---------------------------------------------------------------------------
+// Local skeleton (unit space), facing down-left in a deep crouch: front arm
+// reaching toward the face, back arm trailing high, hips low over the board.
+// Transformed by scale + a slight lean rotation around the board centre.
+const S = {
+  boardA: [-66, 17], boardB: [70, -21],
+  backFoot: [27, -11], frontFoot: [-26, 5],
+  backKnee: [42, -38], frontKnee: [-36, -30],
+  hip: [0, -60], shoulder: [-18, -98], head: [-26, -116],
+  frontHand: [-62, -62], backHand: [48, -92],
+};
+const SC = [436, 656];
+const S_SCALE = 0.68, S_ROT = -0.12;
+const S_COS = Math.cos(S_ROT), S_SIN = Math.sin(S_ROT);
+function sp(p) {
+  const x = p[0] * S_SCALE, y = p[1] * S_SCALE;
+  return [SC[0] + x * S_COS - y * S_SIN, SC[1] + x * S_SIN + y * S_COS];
+}
+
+const RIM = [0.45, 0.92, 1.0];
+const BODY = [0.016, 0.022, 0.05];
+function drawSurfer(off, color, alpha) {
+  const o = (p) => { const q = sp(p); return [q[0] + off[0], q[1] + off[1]]; };
+  let a, b;
+  a = o(S.boardA); b = o(S.boardB);
+  capsule(a[0], a[1], b[0], b[1], 5.5, color, alpha);
+  // legs: foot -> knee -> hip
+  a = o(S.backFoot); b = o(S.backKnee); capsule(a[0], a[1], b[0], b[1], 7, color, alpha);
+  a = o(S.backKnee); b = o(S.hip); capsule(a[0], a[1], b[0], b[1], 7.5, color, alpha);
+  a = o(S.frontFoot); b = o(S.frontKnee); capsule(a[0], a[1], b[0], b[1], 7, color, alpha);
+  a = o(S.frontKnee); b = o(S.hip); capsule(a[0], a[1], b[0], b[1], 7.5, color, alpha);
+  // torso and arms
+  a = o(S.hip); b = o(S.shoulder); capsule(a[0], a[1], b[0], b[1], 9.5, color, alpha);
+  a = o(S.shoulder); b = o(S.frontHand); capsule(a[0], a[1], b[0], b[1], 6, color, alpha);
+  a = o(S.shoulder); b = o(S.backHand); capsule(a[0], a[1], b[0], b[1], 6, color, alpha);
+  const h = o(S.head);
+  disc(h[0], h[1], 10, 1.5, color, alpha);
+}
+// cyan rim light first (starlight from the barrel, up-left), then the body.
+drawSurfer([-3, -3.5], RIM, 0.85);
+drawSurfer([0, 0], BODY, 1);
+// a bright edge along the board's top
+{
+  const a = sp(S.boardA), b = sp(S.boardB);
+  capsule(a[0], a[1] - 4.5, b[0], b[1] - 4.5, 1.4, RIM, 0.8);
+}
+// splash bursting at the board, and a wake trailing up the face behind it
+for (let k = 0; k < 110; k++) {
+  const bx = SC[0] + (rng() * 2 - 1) * 52;
+  const by = SC[1] + 10 + rng() * 18;
+  splat(bx, by, 1.4 + rng() * 3.6, [0.94, 0.98, 1.0], 0.16 + rng() * 0.32);
+}
+for (let k = 0; k < 14; k++) {
+  const t = k / 14;
+  const wx = SC[0] + 30 + t * 90, wy = SC[1] + 6 - t * 26;
+  splat(wx, wy, 2 + rng() * 4, [0.92, 0.97, 1.0], 0.13 * (1 - t) + 0.03);
+}
+
+// ---------------------------------------------------------------------------
+// Finish: vignette + deterministic dither, then encode
+// ---------------------------------------------------------------------------
+
+for (let y = 0; y < H; y++) {
+  for (let x = 0; x < W; x++) {
+    const dx = (x - W / 2) / (W / 2), dy = (y - H / 2) / (H / 2);
+    const d2 = dx * dx + dy * dy;
+    const vig = 1 - 0.16 * smooth(0.55, 1.45, d2);
+    const i = (y * W + x) * 3;
+    buf[i] *= vig; buf[i + 1] *= vig; buf[i + 2] *= vig;
+  }
+}
+
+// Minimal PNG encoder: 8-bit RGB, adaptive per-row filters, zlib deflate.
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (let n = 0; n < bytes.length; n++) {
+    crc ^= bytes[n];
+    for (let k = 0; k < 8; k++) {
+      crc = crc & 1 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function chunk(type, data) {
+  const out = Buffer.alloc(12 + data.length);
+  out.writeUInt32BE(data.length, 0);
+  out.write(type, 4, "ascii");
+  data.copy(out, 8);
+  const crcData = Buffer.concat([Buffer.from(type, "ascii"), data]);
+  out.writeUInt32BE(crc32(crcData), 8 + data.length);
+  return out;
+}
+
+function encodePNG() {
+  const raw = Buffer.alloc(H * (1 + W * 3));
+  const prev = new Uint8Array(W * 3);
+  const cur = new Uint8Array(W * 3);
+  let pos = 0;
+  const dith = mulberry32(0xd17e);
   for (let y = 0; y < H; y++) {
     for (let x = 0; x < W; x++) {
       const i = (y * W + x) * 3;
-      let r = buf[i], g = buf[i + 1], b = buf[i + 2];
-      const luma = 0.299 * r + 0.587 * g + 0.114 * b;
-      r = luma + (r - luma) * 1.13;
-      g = luma + (g - luma) * 1.13;
-      b = luma + (b - luma) * 1.13;
-      r = (r - 128) * 1.05 + 128;
-      g = (g - 128) * 1.05 + 128;
-      b = (b - 128) * 1.05 + 128;
-      const d = Math.hypot(x - cx, y - cy) / maxD;
-      const v = 1 - 0.20 * smoothstep(0.52, 1.05, d);
-      buf[i] = clamp255(r * v); buf[i + 1] = clamp255(g * v); buf[i + 2] = clamp255(b * v);
+      const dn = (dith() - 0.5) * (1.6 / 255);
+      cur[x * 3] = clamp(Math.round((buf[i] + dn) * 255), 0, 255);
+      cur[x * 3 + 1] = clamp(Math.round((buf[i + 1] + dn) * 255), 0, 255);
+      cur[x * 3 + 2] = clamp(Math.round((buf[i + 2] + dn) * 255), 0, 255);
     }
-  }
-}
-
-// ---------------------------------------------------------------- downsample
-const img = new Uint8Array(OUT * OUT * 3);
-for (let y = 0; y < OUT; y++) {
-  for (let x = 0; x < OUT; x++) {
-    let r = 0, g = 0, b = 0;
-    for (let dy = 0; dy < SS; dy++) {
-      for (let dx = 0; dx < SS; dx++) {
-        const i = ((y * SS + dy) * W + (x * SS + dx)) * 3;
-        r += buf[i]; g += buf[i + 1]; b += buf[i + 2];
-      }
-    }
-    const o = (y * OUT + x) * 3, n = SS * SS;
-    img[o] = Math.round(r / n); img[o + 1] = Math.round(g / n); img[o + 2] = Math.round(b / n);
-  }
-}
-
-// ---------------------------------------------------------------- PNG encode
-const CRC_TABLE = (() => {
-  const table = new Int32Array(256);
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
-    table[n] = c;
-  }
-  return table;
-})();
-function crc32(bytes) {
-  let c = 0xFFFFFFFF;
-  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
-  return (c ^ 0xFFFFFFFF) >>> 0;
-}
-function chunk(type, data) {
-  const out = new Uint8Array(12 + data.length);
-  const dv = new DataView(out.buffer);
-  dv.setUint32(0, data.length);
-  for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
-  out.set(data, 8);
-  dv.setUint32(8 + data.length, crc32(out.subarray(4, 8 + data.length)));
-  return out;
-}
-function paeth(a, b, c) {
-  const p = a + b - c, pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c);
-  return pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
-}
-// choose, per row, the filter (None/Sub/Up/Average/Paeth) with the least
-// absolute signed-byte sum — keeps gradients and smooth shading small
-function encodePNG(width, height, rgb) {
-  const bpp = 3, stride = width * bpp;
-  const raw = new Uint8Array((stride + 1) * height);
-  const filt = new Uint8Array(stride);
-  for (let y = 0; y < height; y++) {
-    const rowOff = y * stride, outOff = y * (stride + 1);
-    let bestType = 0, bestScore = Infinity, bestRow = null;
-    for (let type = 0; type <= 4; type++) {
+    // choose the filter with the smallest signed-byte score
+    let bestType = 0, bestData = null, bestScore = Infinity;
+    for (let f = 0; f <= 4; f++) {
+      const fd = new Uint8Array(W * 3);
       let score = 0;
-      for (let i = 0; i < stride; i++) {
-        const cur = rgb[rowOff + i];
-        const a = i >= bpp ? rgb[rowOff + i - bpp] : 0;
-        const b = y > 0 ? rgb[rowOff - stride + i] : 0;
-        const c = y > 0 && i >= bpp ? rgb[rowOff - stride + i - bpp] : 0;
-        let v;
-        if (type === 0) v = cur;
-        else if (type === 1) v = cur - a;
-        else if (type === 2) v = cur - b;
-        else if (type === 3) v = cur - ((a + b) >> 1);
-        else v = cur - paeth(a, b, c);
-        v &= 0xFF;
-        filt[i] = v;
+      for (let n = 0; n < W * 3; n++) {
+        const a = n >= 3 ? cur[n - 3] : 0;
+        const b = prev[n];
+        const c = n >= 3 ? prev[n - 3] : 0;
+        let pred = 0;
+        if (f === 1) pred = a;
+        else if (f === 2) pred = b;
+        else if (f === 3) pred = (a + b) >> 1;
+        else if (f === 4) {
+          const p = a + b - c;
+          const pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c);
+          pred = pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+        }
+        const v = (cur[n] - pred) & 0xff;
+        fd[n] = v;
         score += v < 128 ? v : 256 - v;
       }
-      if (score < bestScore) { bestScore = score; bestType = type; bestRow = filt.slice(); }
+      if (score < bestScore) { bestScore = score; bestType = f; bestData = fd; }
     }
-    raw[outOff] = bestType;
-    raw.set(bestRow, outOff + 1);
+    raw[pos++] = bestType;
+    raw.set(bestData, pos);
+    pos += W * 3;
+    prev.set(cur);
   }
-  const ihdr = new Uint8Array(13);
-  const dv = new DataView(ihdr.buffer);
-  dv.setUint32(0, width); dv.setUint32(4, height);
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(W, 0);
+  ihdr.writeUInt32BE(H, 4);
   ihdr[8] = 8; // bit depth
   ihdr[9] = 2; // colour type: truecolour RGB
   const idat = deflateSync(raw, { level: 9 });
-  const sig = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
-  const parts = [sig, chunk('IHDR', ihdr), chunk('IDAT', idat), chunk('IEND', new Uint8Array(0))];
-  const total = parts.reduce((s, p) => s + p.length, 0);
-  const png = new Uint8Array(total);
-  let off = 0;
-  for (const p of parts) { png.set(p, off); off += p.length; }
-  return png;
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", ihdr),
+    chunk("IDAT", idat),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
 }
 
-const png = encodePNG(OUT, OUT, img);
-const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const outDir = process.env.MAKEFUN_OUTPUT_DIR || "/output";
 mkdirSync(outDir, { recursive: true });
-const outPath = join(outDir, 'entry.png');
-writeFileSync(outPath, png);
-console.log(`wrote ${outPath} (${png.length} bytes)`);
+const png = encodePNG();
+writeFileSync(join(outDir, "entry.png"), png);
+console.log(`wrote ${join(outDir, "entry.png")} (${png.length} bytes)`);
