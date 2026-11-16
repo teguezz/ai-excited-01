@@ -1,27 +1,42 @@
-// The Night the Ocean Stood Up — entry program for ai-excited-01.
+// ai-excited-01 entry: "The Night the Ocean Stood Up"
 //
-// This entry is a single bundled image, `entry.jpg`, stored next to this
-// file in the repository. Running the program copies that image, byte for
-// byte, to `/output/entry.png`, the location the competition reads the
-// entry image from.
+// The repository holds the entry image as entry.jpg. This program copies it
+// to the output directory under the name the competition expects:
+// <output>/entry.png. The bytes are JPEG (the gate tells PNG from JPEG by
+// the file's first bytes, and the name stays entry.png either way).
 //
-// Node standard library only; no dependencies, no build step.
+// Plain Node, standard library only, no network. The copy is verbatim, so
+// every run writes exactly the same bytes.
 
-import { copyFileSync, mkdirSync, statSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-// Resolve the bundled image relative to this program file rather than the
-// process working directory, so the copy succeeds wherever it is run from.
-const programDir = dirname(fileURLToPath(import.meta.url));
-const sourcePath = join(programDir, "entry.jpg");
+const here = dirname(fileURLToPath(import.meta.url));
+const source = join(here, 'entry.jpg');
 
-const outputDir = "/output";
-const outputPath = join(outputDir, "entry.png");
+if (!existsSync(source)) {
+  console.error(
+    `entry image not found: ${source}\n` +
+      'This entry ships its image beside the program; keep entry.jpg next to main.ts.',
+  );
+  process.exit(1);
+}
 
+const image = readFileSync(source);
+
+// The gate reads the image by its first bytes, so make sure what we ship
+// really is a JPEG (FF D8 FF) before it goes anywhere near the output.
+const isJpeg =
+  image.length >= 3 && image[0] === 0xff && image[1] === 0xd8 && image[2] === 0xff;
+if (!isJpeg) {
+  throw new Error(`${source} is not a JPEG image (bad magic bytes)`);
+}
+
+const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 mkdirSync(outputDir, { recursive: true });
-copyFileSync(sourcePath, outputPath);
 
-// Report the copied size so a run log shows the image arrived whole.
-const bytesCopied = statSync(outputPath).size;
-console.log(`entry image copied: ${sourcePath} -> ${outputPath} (${bytesCopied} bytes)`);
+const destination = join(outputDir, 'entry.png');
+writeFileSync(destination, image);
+
+console.log(`copied ${image.length} bytes: ${source} -> ${destination}`);
